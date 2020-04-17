@@ -1,0 +1,41 @@
+---
+title: "week13"
+author: "Dana Tomeh"
+date: "4/17/2020"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# RStudio API Code 
+
+# Libraries
+```{r}
+library(twitteR)
+library(tidyverse)
+library(readr)
+```
+
+
+# Data Import and Cleaning
+```{r}
+api <- "i8qKfmFT2QK0yAXI4q8zon1zt"
+apiSecret <- "uzXTpCJqbMInxXvOmIEuMgkYPoU2KZzAWYdSExQKykh3HHOVNS"
+access <- "48436651-qNVHDPMkTOmmxTKdViX3AxuLET1COqil6yS0Hk9U3"
+accessSecret <- "qqFeYeSliCQuhQ38Cl0LwiA8JwBcffU6lbxlBa1Uqi8Ab"
+setup_twitter_oauth(api, apiSecret, access, accessSecret)
+
+tweets <- searchTwitter("#Weekend", 5000)
+tweets_clean <- strip_retweets(tweets)
+imported_tbl <- twListToDF(tweets_clean)
+
+imported_tbl$text <- imported_tbl$text %>% iconv("UTF-8", "ASCII", sub="")
+write_csv(imported_tbl, "../output/tweets_original.csv")
+```
+
+
+# Analysis
+
+# Visualization
