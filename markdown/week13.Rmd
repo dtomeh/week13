@@ -16,26 +16,291 @@ knitr::opts_chunk$set(echo = TRUE)
 library(twitteR)
 library(tidyverse)
 library(readr)
+library(tm)
+library(qdap)
+library(textstem)
+library(RWeka)
+library(wordcloud)
+library(ggplot2)
+library(tidytext)
+library(ldatuning)
+library(parallel)
+library(doParallel)
+library(topicmodels)
+library(caret)
 ```
 
 
 # Data Import and Cleaning
-```{r}
-api <- "i8qKfmFT2QK0yAXI4q8zon1zt"
-apiSecret <- "uzXTpCJqbMInxXvOmIEuMgkYPoU2KZzAWYdSExQKykh3HHOVNS"
-access <- "48436651-qNVHDPMkTOmmxTKdViX3AxuLET1COqil6yS0Hk9U3"
-accessSecret <- "qqFeYeSliCQuhQ38Cl0LwiA8JwBcffU6lbxlBa1Uqi8Ab"
-setup_twitter_oauth(api, apiSecret, access, accessSecret)
 
-tweets <- searchTwitter("#Weekend", 5000)
-tweets_clean <- strip_retweets(tweets)
-imported_tbl <- twListToDF(tweets_clean)
+* Setting up the twitter API so that tweets can be stripped
+* The second chunk of cooded then pulls the first 5000 tweets that reference the hashtag #Weekend, and then strips retweets. Finally it converts the data into a data frame. 
+* Selected the necessary variables - the tweet itself, the favorite count, and the retweet count
+* Finally, the imported_tbl is exported as a csv and saved in the output folder as "tweets_original.csv"
+```{r}
+
+# api <- "i8qKfmFT2QK0yAXI4q8zon1zt"
+# apiSecret <- "uzXTpCJqbMInxXvOmIEuMgkYPoU2KZzAWYdSExQKykh3HHOVNS"
+# access <- "48436651-qNVHDPMkTOmmxTKdViX3AxuLET1COqil6yS0Hk9U3"
+# accessSecret <- "qqFeYeSliCQuhQ38Cl0LwiA8JwBcffU6lbxlBa1Uqi8Ab"
+# setup_twitter_oauth(api, apiSecret, access, accessSecret)
+# 
+# tweets <- searchTwitter("#Weekend", 5000)
+# tweets_clean <- strip_retweets(tweets)
+# tweets_tbl <- twListToDF(tweets_clean) 
+
+imported_tbl <- read_csv("../output/tweets_original.csv")
+
+imported_tbl <- imported_tbl %>%
+  select(text, favoriteCount, retweetCount)
 
 imported_tbl$text <- imported_tbl$text %>% iconv("UTF-8", "ASCII", sub="")
 write_csv(imported_tbl, "../output/tweets_original.csv")
+
+```
+
+* In this second block of data import and cleaning, the tweets from above will be converted into preprocessed lemmas
+* Created the twitter_cp corpus
+* Mapped the corpus as a plain text document 
+* Replaced abbreviations with full words 
+* Replaced contractions with the words that make them up 
+* Converted all letters to lowercawse
+* Removed numbers from corpus
+* Removed punctuation (including hashtags)
+* Removed Stop words
+* Stripped extra white space from tweets
+* Lemmatized the words to their english stems
+```{r}
+twitter_cp <- VCorpus(VectorSource(imported_tbl$text))
+twitter_cp <- tm_map(twitter_cp, PlainTextDocument)
+twitter_cp <- tm_map(twitter_cp, content_transformer(replace_abbreviation))
+twitter_cp <- tm_map(twitter_cp, content_transformer(replace_contraction))
+twitter_cp <- tm_map(twitter_cp, content_transformer(str_to_lower))
+twitter_cp <- tm_map(twitter_cp, removeNumbers)
+twitter_cp <- tm_map(twitter_cp, removePunctuation)
+twitter_cp <- tm_map(twitter_cp, removeWords, stopwords("en"))
+twitter_cp <- tm_map(twitter_cp, stripWhitespace)
+twitter_cp <- lemmatize_words(twitter_cp)
+```
+
+We continue DAta cleaning and import in the following block 
+* myTokenizer contains a function to tokenize the preprocessed corpus into a unigram and bigram
+* twitter_dtm converts the corpus into a matrix of unigram and bigram tokens
+* we then remove all sparse terms from twitter_dtm, and end up with 129 tokens
+* we then count the rows that have no endorsed tokens, and remove them 
+* Finally, the rows to be dropped from the DTM are applied to the imported_tbl to create a finalized tibble with tokens as columns, and all rows of remaining tweets including at least one endorsed token.
+
+```{r}
+myTokenizer <- function(x) { NGramTokenizer(x, Weka_control(min=1, max=2)) }
+twitter_dtm <- DocumentTermMatrix(twitter_cp, control = list(tokenize = myTokenizer ))
+twitter_dtm <-removeSparseTerms(twitter_dtm, .99)
+tokenCounts <- apply(twitter_dtm, 1, sum)
+twitter_dtm <- twitter_dtm[tokenCounts > 0, ]
+dropped_tbl <- imported_tbl[tokenCounts >0, ]
+```
+
+# Visualization
+
+* Here we set our slimmed and cleaned matrix as a tibble and then drop the term "weekend" which was our original hashtag search term on twitter 
+* wordCounts calculates how many times each token was endorsed
+* wordNames pulls the actual tokens
+* in wordcloud, word names are set as the words for the clouds, the counts from wordCounts tell us how many times they have appeared, and we decide to show the top 50 words. 
+```{r}
+twitter_tbl <- as_tibble(as.matrix(twitter_dtm)) %>%
+  select(!weekend) 
+wordCounts <- colSums(twitter_tbl)
+wordNames <- names(twitter_tbl)
+wordcloud(wordNames, wordCounts, max.words=50)
+
+```
+
+* Below we create a horizontal bar graph in descending order of frequency of endorsement 
+* First we use wordNames and wordCounts from above and create a tibble
+* Then we arrange the tibble in descending order based on the count of the word 
+* We choose to select the top 20 words
+* Reorder them 
+* Plot from most to least frequent (of the top 20) in a horizontal bar graph
+
+```{r}
+tibble(wordNames, wordCounts) %>%
+  arrange(desc(wordCounts)) %>%
+  top_n(20) %>%
+  mutate(wordNames = reorder(wordNames, wordCounts)) %>% 
+  ggplot(aes(x=wordNames,y=wordCounts))+ geom_col() + coord_flip()
 ```
 
 
 # Analysis
 
-# Visualization
+## Topic Modeling
+
+```{r}
+# Preemptively reset the document names in the twitter_dtm document Term matrix to be the text from the tweets. This allows us to group by document value later on when looking at gamma from the LDA. If we don't do this we end up with a bunch of charactger(0) and are unable to group.
+
+twitter_dtm$dimnames$Docs <- dropped_tbl$text
+
+#Setting up parallelization to make the following code faster 
+
+local_cluster <- makeCluster(detectCores()-1)
+registerDoParallel(local_cluster)
+
+#Tuning four different metrics to decide what number of topics we have across our dataset of tokens
+
+tuning <- FindTopicsNumber( twitter_dtm, topics = seq(2,18,1), metrics = c("Griffiths2004","CaoJuan2009", "Arun2010", "Deveaud2014"), verbose = T)
+FindTopicsNumber_plot(tuning)
+
+#returning to normal processing
+stopCluster(local_cluster) 
+registerDoSEQ()
+```
+Griffiths (2004) line is essentially a perfectly increasing curve so its meaningless. There are some dips and climps but it flattens out between 11 and 15. Since it's a max curve it indicates a number of topics between 11 and 15
+Deveaud (2014) has three peaks, at 5, 10 and 13. The peaks at 5 and 13 are about the same, and the one at 10 is slightly higher. 
+Minima of Both Arun (2010) and Cao Juan (2009) indicate that we might be looking at 13 topics. The minimum is technically 15 but there isn't a lot of differentiation there so i'm going with 13. 
+
+As a result of these curves, i'm going with 13 topics. 
+
+Below we will use the LDA betas to determine the probability that a word belongs to a topic
+```{r}
+lda_results <- LDA(twitter_dtm, 13)
+lda_betas <- tidy(lda_results, matrix="beta")
+
+betas <-lda_betas %>% 
+  group_by(topic) %>% 
+  top_n(10, beta) %>% 
+  arrange(topic, -beta) 
+betas
+```
+
+Below we will use the LDA Gammas to determine the probability that the document contains the topic
+
+* the topics variable also shows us the most likely topic per tweet in this dataset (by using top_n(1, gamma) we select the most likely topic)
+```{r}
+lda_gammas <- tidy(lda_results, matrix="gamma")
+
+topics <- lda_gammas%>%
+  group_by(document) %>%
+  top_n(1, gamma) %>%
+  ungroup %>%
+  arrange(document) #this is the tweet value. we changed this above to make sure that it says the actual tweet and not character(0)
+
+topics
+```
+
+
+
+* Below is the code to add the topic number to the twitter tibble we created above that contains all the tokens.
+* First I wanted to make sure that we were adding the right topic to the right tweet based on the gamma values from the LDA. So to do that I added the tweet to the twitter tibble then arranged by tweet (resulting in 129 columns), which puts the rows in the same order as the code that created the topics dataframe above (which is arranged by tweet in a column called document)
+* Used cbind to add in the topic column to the twitter_tbl, resulting in 130 columns
+```{r}
+twitter_tbl <- twitter_tbl %>%
+  mutate(tweet = dropped_tbl$text) %>%
+  arrange(tweet)
+
+twitter_tbl <- cbind(twitter_tbl, topics$topic)
+  
+```
+
+Based on the analysis above here are speculations regarding what the topics may mean:
+Topic 1: References time and relaxation, so maybe taking time to refresh over the weekend
+Topic 2: Doesn't seem super cohesive. It references taking care and getting stuff done 
+Topic 3: Seems to reference doing stuff, like music, family, and getting ready
+Topic 4: Just mentions friday and the weekend again, so just comments that its friday maybe?
+Topic 5: Also references friday thoughts, vibes and feelings. 
+Topic 6: References tokens like beautiful, nature, and love. So separates beauty and love out 
+Topic 7: Has a lot of two word tokens referencing enjoyment and plans. So people enjoy the weekend 
+Topic 8: Mentions almost entirely safety related tokens. So styaing safe
+Topic 9: Referencing staying home and staying safe again, so likely related to staying home because of the virus
+Topic 10: Lots of combinations of happy weekend and friday so even in lockdown people are excited for the weekend 
+Topic 11: A little incohesive. Mentioning great, day, today, and another. Maybe people are having good fridays? 
+Topic 12: Better, fantastic, good, and enjoy. Seems like wishes for a good weekend 
+Topic 13: This last topic mentions covid, quarantine, and work. So references to be quarantined for the weekend cuz of covid? 
+
+## Machine Learning 
+
+* Here I arranged dropped_tbl by tweet (which is called text here) to make sure that it is in the same order as twitter_tbl.
+* Then I added the favoriteCount from the dropped_tbl to twitter_tbl
+* I used colnames to rename the two added columns for clarity
+* svr_mod1 does not include the topic as a predictor of tweet popularity (favoriteCount)
+* svr_mod2 does include the topic as a predictor of tweet popularity (favoriteCount)
+
+```{r}
+dropped_tbl <- dropped_tbl %>%
+  arrange(text)
+
+twitter_tbl <- cbind(twitter_tbl, dropped_tbl$favoriteCount)
+colnames(twitter_tbl)[130] <- "topic"
+colnames(twitter_tbl)[131] <-"favoriteCount"
+
+# setting up Parallelization
+local_cluster <- makeCluster(detectCores()-1)
+registerDoParallel(local_cluster)
+
+svr_mod1 <- train(
+ favoriteCount ~ . -tweet -topic, #models all variables as predictors of favorite count except for the tweet itself and topic number
+ twitter_tbl, 
+ method="svmLinear",
+ preProcess=c("center", "scale", "zv", "medianImpute"), 
+ trControl= trainControl(method="cv", number = 10, verboseIter = T), 
+ na.action = na.pass
+)
+
+svr_mod2 <- train(
+ favoriteCount ~ . -tweet, #models all variables as predictors of favorite count except for the tweet itself 
+ twitter_tbl, 
+ method="svmLinear",
+ preProcess=c("center", "scale", "zv", "medianImpute"), 
+ trControl= trainControl(method="cv", number = 10, verboseIter = T), 
+ na.action = na.pass
+)
+
+#stopping parallelization
+
+stopCluster(local_cluster) 
+registerDoSEQ()
+
+#testing the model on the holdout data 
+
+#testing the correlation between the svr_mod1 predictions and the actual outcome variables 
+mod1_cor <- cor.test(predict(svr_mod1, twitter_tbl, na.action=na.pass)
+, twitter_tbl$favoriteCount)
+mod2_cor <- cor.test(predict(svr_mod2, twitter_tbl, na.action=na.pass)
+, twitter_tbl$favoriteCount)
+```
+The correlation between the actual favoriteCounts and the predicted ones in model one (does not include topic number) is `r mod1_cor$estimate` and for model two (includes topic number) is `r mod2_cor$estimate`. They are essentially identical.
+
+
+```{r}
+summary(resamples(list("SVR without Topic" = svr_mod1, "SVR with Topic" = svr_mod2)))
+```
+Without including the Topic in the model, the mean MAE is smaller (5.817) than when the topic is included in the model (5.822). A smaller MAE is preferred, which indicates excluding the topic from the model. However, the MAEs are quite similar so it may not be actually indicative of one model being better than the other.
+Without inlcuding the Topic in the model, the mean RMSE is smaller (25.584) than when the topic is included in the model (26.584). A smaller RMSE is preferred, which indicates excluding the topic from the model. However, the RMSEs are quite similar so it may not be actually indicative of one model being better than the other.
+Without including the Topic in the model, the mean Rsquared is smaller (.0007) than when the topic is included in the model (.0015). A larger Rsquared is preferred, which indicates including the topic score in the model. The difference here is a little more drastic than the MAE or RMSE (the Rsquared of the model that includes the topic is double that of the one that does not), but the values are miniscule, so again there is a lack of clear indication as to model preference.
+
+### Rsquared plot 
+
+This plot shows a larger Rsquared for the model that includes the topic than the model that excludes it. However, the CI of the model that excludes the topic is completely included within the CI of the model that includes it. 
+```{r}
+dotplot(resamples(list("SVR without Topic" = svr_mod1, "SVR with Topic" = svr_mod2)), metric = "Rsquared")
+```
+
+### RMSE Plot
+
+This plot shows a smaller RMSE for the model that excludes the topic value, than the one that includes it. However the CI of the model that includes the topic is completely nested within the model that excludes the topic. 
+```{r}
+dotplot(resamples(list("SVR without Topic" = svr_mod1, "SVR with Topic" = svr_mod2)), metric = "RMSE")
+```
+
+### MAE 
+
+This plot shows very similar MAE values for the two models. However the CI of the model that includes the topic is completely nested within the model that excludes the topic. 
+```{r}
+dotplot(resamples(list("SVR without Topic" = svr_mod1, "SVR with Topic" = svr_mod2)), metric = "MAE")
+```
+
+ 
+## Final Interpretation
+
+In this case its hard to say that topic modeling had a lot to do with predicting the popularity of tweets. There are many reasons why this might be. The first is that I used the hashtag #weekend which I'd beleive generally most people are positive about, meaning emotion didn't really come into play as much. Also, My topics as determined by the gamma analysis are all super similar, it was hard to distinguish between many of them. The two models had similar RMSE, MAE, and Rsquared values, and their correlations between the predicted and actual values were essentually the same (and pretty small). 
+That being said, I think it would be impossible to pick a model that better predicted popularity, so the inclusion of the topic didn't really help the modeling. 
+I actually did expect to see a realationship between the topic and the prediction, but I think I limited myself by pulling tweets that had very little variance in terms of emotion or content .
+Even just reading through the tokens that I ended up with, you can kind of tell the sentiment there. Many reference positive emotion, fridays, happy, good, fantstic, so on. 
